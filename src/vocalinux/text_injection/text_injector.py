@@ -82,6 +82,12 @@ class TextInjector:
         self._clipboard_tool_health = {}
         self._clipboard_timeout = 0.35
 
+        # Window-aware injection routing (Wayland only). IBus commits reach
+        # X11/XWayland clients but not native-Wayland surfaces (Chromium,
+        # Electron, ...), so for those windows we fall back to the Wayland
+        # virtual-keyboard tool while keeping IBus everywhere it works.
+        self._window_aware_injection, self._force_ibus_apps = self._load_routing_config()
+
         # Force Wayland mode if requested
         if wayland_mode and self.environment == DesktopEnvironment.X11:
             logger.info("Forcing Wayland compatibility mode")
@@ -577,6 +583,99 @@ class TextInjector:
         except Exception as e:
             logger.debug(f"Could not show clipboard notification: {e}")
 
+    def _load_routing_config(self) -> tuple:
+        """
+        Read window-aware injection settings from the user config.
+
+        Returns:
+            (enabled, force_ibus_apps). Defaults to enabled with no forced
+            apps. Reading is best-effort to avoid a hard UI dependency.
+        """
+        enabled = True
+        force_ibus_apps: list = []
+        try:
+            import json
+
+            config_path = os.path.expanduser("~/.config/vocalinux/config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    section = json.load(f).get("text_injection", {})
+                enabled = section.get("wayland_window_aware_injection", True)
+                force_ibus_apps = section.get("force_ibus_apps", []) or []
+        except Exception as e:
+            logger.debug(f"Could not read window-aware injection config: {e}")
+        return enabled, force_ibus_apps
+
+    def _wayland_focus_backend(self) -> str:
+        """
+        Choose 'ibus' or 'wtype' for the currently focused Wayland window.
+
+        IBus delivers to X11/XWayland clients (via XIM) but not to native-
+        Wayland surfaces, which use the text-input protocol with no IBus
+        bridge. ``xdotool getactivewindow`` only sees X11 windows, so a
+        focused X11/XWayland window means IBus will work; otherwise it will
+        not. Falls back to 'ibus' (prior behaviour) when detection is not
+        possible.
+        """
+        if not shutil.which("xdotool"):
+            return "ibus"  # cannot detect; preserve prior behaviour
+        try:
+            result = subprocess.run(
+                ["xdotool", "getactivewindow"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1,
+            )
+            focused_is_x11 = result.returncode == 0 and bool(result.stdout.strip())
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.debug(f"Focused-window detection failed: {e}")
+            return "ibus"
+
+        if focused_is_x11:
+            return "ibus"
+
+        # Native-Wayland window: default to wtype, unless the app is on the
+        # force-IBus allowlist (e.g. a native-Wayland GTK/Qt app that is an
+        # IBus client via GTK_IM_MODULE=ibus).
+        if self._force_ibus_apps:
+            app_id = self._focused_wayland_app_id()
+            if app_id and any(token.lower() in app_id.lower() for token in self._force_ibus_apps):
+                logger.debug(f"Focused app '{app_id}' is on the force-IBus list, using IBus")
+                return "ibus"
+        return "wtype"
+
+    def _focused_wayland_app_id(self) -> Optional[str]:
+        """Best-effort app_id/class of the focused window via Sway/i3 IPC."""
+        if not shutil.which("swaymsg"):
+            return None
+        try:
+            import json
+
+            result = subprocess.run(
+                ["swaymsg", "-t", "get_tree"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1,
+            )
+            if result.returncode != 0:
+                return None
+            tree = json.loads(result.stdout)
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
+            logger.debug(f"Could not query focused app id: {e}")
+            return None
+
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            if node.get("focused"):
+                props = node.get("window_properties") or {}
+                return node.get("app_id") or props.get("class")
+            stack.extend(node.get("nodes", []) or [])
+            stack.extend(node.get("floating_nodes", []) or [])
+        return None
+
     def inject_text(self, text: str) -> bool:
         """
         Inject text into the currently focused application.
@@ -611,10 +710,28 @@ class TextInjector:
                 current_env = self.environment
                 ibus_injector = self._ibus_injector
 
-            if (
+            # Decide whether IBus can deliver to the focused window. On Wayland,
+            # IBus commits never reach native-Wayland surfaces (e.g. Chromium),
+            # so route those injections to the Wayland virtual-keyboard tool while
+            # keeping IBus for X11/XWayland clients.
+            use_ibus = (
                 current_env == DesktopEnvironment.WAYLAND_IBUS
                 or current_env == DesktopEnvironment.X11_IBUS
+            )
+            if (
+                use_ibus
+                and current_env == DesktopEnvironment.WAYLAND_IBUS
+                and self._window_aware_injection
+                and getattr(self, "wayland_tool", None)
+                and self._wayland_focus_backend() == "wtype"
             ):
+                use_ibus = False
+                logger.info(
+                    "Focused window is a native-Wayland surface; routing this "
+                    f"injection via {self.wayland_tool} instead of IBus"
+                )
+
+            if use_ibus:
                 if ibus_injector is not None:
                     result = ibus_injector.inject_text(text)
                     if result:

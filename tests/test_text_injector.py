@@ -1503,6 +1503,8 @@ class TestIBusRuntimeFallback(unittest.TestCase):
                 injector._ibus_init_thread.join(timeout=5)
             self.assertEqual(injector.environment, DesktopEnvironment.WAYLAND_IBUS)
 
+            # Isolate the IBus->wtype runtime fallback from per-window routing.
+            injector._window_aware_injection = False
             result = injector.inject_text("Hello via wayland fallback")
 
         self.assertTrue(result)
@@ -1638,3 +1640,105 @@ class TestIBusRuntimeFallback(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertEqual(injector.environment, DesktopEnvironment.X11)
+
+
+class TestWaylandWindowAwareRouting(unittest.TestCase):
+    """Tests for per-window backend selection on Wayland (IBus vs wtype)."""
+
+    def _injector(self, **attrs):
+        """Build a bare TextInjector with only the attributes routing needs."""
+        inj = TextInjector.__new__(TextInjector)
+        inj._force_ibus_apps = []
+        inj._window_aware_injection = True
+        for k, v in attrs.items():
+            setattr(inj, k, v)
+        return inj
+
+    # ---- _wayland_focus_backend detection ----
+
+    @patch("vocalinux.text_injection.text_injector.subprocess.run")
+    @patch("vocalinux.text_injection.text_injector.shutil.which")
+    def test_native_wayland_window_selects_wtype(self, mock_which, mock_run):
+        """A focused window invisible to X11 (rc!=0) routes to wtype."""
+        mock_which.side_effect = lambda c: "/usr/bin/xdotool" if c == "xdotool" else None
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+
+        self.assertEqual(self._injector()._wayland_focus_backend(), "wtype")
+
+    @patch("vocalinux.text_injection.text_injector.subprocess.run")
+    @patch("vocalinux.text_injection.text_injector.shutil.which")
+    def test_xwayland_window_selects_ibus(self, mock_which, mock_run):
+        """A focused X11/XWayland window (rc==0 with id) routes to ibus."""
+        mock_which.side_effect = lambda c: "/usr/bin/xdotool" if c == "xdotool" else None
+        mock_run.return_value = MagicMock(returncode=0, stdout="20971526\n")
+
+        self.assertEqual(self._injector()._wayland_focus_backend(), "ibus")
+
+    @patch("vocalinux.text_injection.text_injector.shutil.which", return_value=None)
+    def test_no_xdotool_preserves_ibus(self, mock_which):
+        """Without xdotool we cannot detect, so keep prior behaviour (ibus)."""
+        self.assertEqual(self._injector()._wayland_focus_backend(), "ibus")
+
+    @patch("vocalinux.text_injection.text_injector.subprocess.run")
+    @patch("vocalinux.text_injection.text_injector.shutil.which")
+    def test_xdotool_error_preserves_ibus(self, mock_which, mock_run):
+        """If xdotool errors out, fall back to ibus rather than misroute."""
+        mock_which.side_effect = lambda c: "/usr/bin/xdotool" if c == "xdotool" else None
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="xdotool", timeout=1)
+
+        self.assertEqual(self._injector()._wayland_focus_backend(), "ibus")
+
+    @patch("vocalinux.text_injection.text_injector.subprocess.run")
+    @patch("vocalinux.text_injection.text_injector.shutil.which")
+    def test_force_ibus_allowlist_overrides_native_wayland(self, mock_which, mock_run):
+        """A native-Wayland app on the force-IBus list still uses IBus."""
+        mock_which.side_effect = lambda c: "/usr/bin/" + c if c in ("xdotool", "swaymsg") else None
+        # 1st call: xdotool getactivewindow -> native wayland (rc=1)
+        # 2nd call: swaymsg get_tree -> focused app_id "foot"
+        tree = '{"focused": true, "app_id": "foot", "nodes": [], "floating_nodes": []}'
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout=""),
+            MagicMock(returncode=0, stdout=tree),
+        ]
+        inj = self._injector(_force_ibus_apps=["foot"])
+        self.assertEqual(inj._wayland_focus_backend(), "ibus")
+
+    # ---- inject_text routing ----
+
+    def _routing_injector(self):
+        inj = self._injector(
+            environment=DesktopEnvironment.WAYLAND_IBUS,
+            _session_environment=DesktopEnvironment.WAYLAND,
+            wayland_tool="wtype",
+            _ibus_injector=MagicMock(),
+        )
+        inj._ibus_injector.inject_text.return_value = True
+        inj._log_current_window_info = MagicMock()
+        inj._should_copy_to_clipboard = MagicMock(return_value=False)
+        inj._inject_with_wayland_tool = MagicMock()
+        return inj
+
+    def test_inject_routes_native_wayland_to_wtype(self):
+        """In WAYLAND_IBUS, a native-Wayland window bypasses IBus for wtype."""
+        inj = self._routing_injector()
+        with patch.object(inj, "_wayland_focus_backend", return_value="wtype"):
+            self.assertTrue(inj.inject_text("hello chrome"))
+        inj._ibus_injector.inject_text.assert_not_called()
+        inj._inject_with_wayland_tool.assert_called_once_with("hello chrome")
+
+    def test_inject_uses_ibus_for_xwayland(self):
+        """In WAYLAND_IBUS, an XWayland window still uses IBus."""
+        inj = self._routing_injector()
+        with patch.object(inj, "_wayland_focus_backend", return_value="ibus"):
+            self.assertTrue(inj.inject_text("hello emacs"))
+        inj._ibus_injector.inject_text.assert_called_once_with("hello emacs")
+        inj._inject_with_wayland_tool.assert_not_called()
+
+    def test_disabled_routing_always_uses_ibus(self):
+        """With window-aware routing off, IBus is used even for native Wayland."""
+        inj = self._routing_injector()
+        inj._window_aware_injection = False
+        with patch.object(inj, "_wayland_focus_backend", return_value="wtype") as probe:
+            self.assertTrue(inj.inject_text("stay on ibus"))
+        probe.assert_not_called()
+        inj._ibus_injector.inject_text.assert_called_once_with("stay on ibus")
