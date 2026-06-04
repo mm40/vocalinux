@@ -290,6 +290,18 @@ such as `medium.en-q5_0` or `large-v3-turbo`. You can also configure this throug
 the graphical Settings dialog, where whisper.cpp models are split into **Model Size**
 and **Specialization** controls.
 
+### Sway / Wayland Compatibility
+
+On Wayland, Vocalinux injects text through IBus, which reaches X11/XWayland apps but **not**
+native-Wayland surfaces such as Chromium and Electron apps (they use the `text-input` protocol,
+which has no IBus bridge under compositors like Sway). For those windows, dictated text silently
+goes nowhere.
+
+Enable **Sway Compatibility** (Settings → General, off by default) to fix this. When on, Vocalinux
+checks the focused window per injection and falls back to the Wayland virtual keyboard
+(`wtype`/`ydotool`) for native-Wayland windows, while keeping IBus for X11/XWayland apps. The
+setting applies immediately — no restart needed. Requires `wtype` or `ydotool` to be installed.
+
 ### Neural Voice Activity Detection
 
 Vocalinux ships with a Silero VAD model and uses it automatically when `onnxruntime` is available. The official installer attempts to install this support automatically. Without it, recording falls back to the simpler amplitude-threshold VAD.
