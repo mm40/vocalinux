@@ -1503,8 +1503,9 @@ class TestIBusRuntimeFallback(unittest.TestCase):
                 injector._ibus_init_thread.join(timeout=5)
             self.assertEqual(injector.environment, DesktopEnvironment.WAYLAND_IBUS)
 
-            # Isolate the IBus->wtype runtime fallback from per-window routing.
-            injector._sway_compatibility = False
+            # Isolate the IBus->wtype runtime fallback from per-window routing
+            # (inject_text re-reads the toggle, so stub it disabled).
+            injector._load_routing_config = lambda: (False, [])
             result = injector.inject_text("Hello via wayland fallback")
 
         self.assertTrue(result)
@@ -1650,6 +1651,7 @@ class TestWaylandWindowAwareRouting(unittest.TestCase):
         inj = TextInjector.__new__(TextInjector)
         inj._force_ibus_apps = []
         inj._sway_compatibility = True
+        inj._state_lock = threading.Lock()
         for k, v in attrs.items():
             setattr(inj, k, v)
         return inj
@@ -1714,7 +1716,7 @@ class TestWaylandWindowAwareRouting(unittest.TestCase):
 
     # ---- inject_text routing ----
 
-    def _routing_injector(self):
+    def _routing_injector(self, enabled=True):
         inj = self._injector(
             environment=DesktopEnvironment.WAYLAND_IBUS,
             _session_environment=DesktopEnvironment.WAYLAND,
@@ -1725,11 +1727,13 @@ class TestWaylandWindowAwareRouting(unittest.TestCase):
         inj._log_current_window_info = MagicMock()
         inj._should_copy_to_clipboard = MagicMock(return_value=False)
         inj._inject_with_wayland_tool = MagicMock()
+        # inject_text re-reads the toggle each call, so stub the read.
+        inj._load_routing_config = MagicMock(return_value=(enabled, []))
         return inj
 
     def test_inject_routes_native_wayland_to_wtype(self):
         """In WAYLAND_IBUS, a native-Wayland window bypasses IBus for wtype."""
-        inj = self._routing_injector()
+        inj = self._routing_injector(enabled=True)
         with patch.object(inj, "_wayland_focus_backend", return_value="wtype"):
             self.assertTrue(inj.inject_text("hello chrome"))
         inj._ibus_injector.inject_text.assert_not_called()
@@ -1737,17 +1741,28 @@ class TestWaylandWindowAwareRouting(unittest.TestCase):
 
     def test_inject_uses_ibus_for_xwayland(self):
         """In WAYLAND_IBUS, an XWayland window still uses IBus."""
-        inj = self._routing_injector()
+        inj = self._routing_injector(enabled=True)
         with patch.object(inj, "_wayland_focus_backend", return_value="ibus"):
             self.assertTrue(inj.inject_text("hello emacs"))
         inj._ibus_injector.inject_text.assert_called_once_with("hello emacs")
         inj._inject_with_wayland_tool.assert_not_called()
 
     def test_disabled_routing_always_uses_ibus(self):
-        """With window-aware routing off, IBus is used even for native Wayland."""
-        inj = self._routing_injector()
-        inj._sway_compatibility = False
+        """With Sway compatibility off, IBus is used even for native Wayland."""
+        inj = self._routing_injector(enabled=False)
         with patch.object(inj, "_wayland_focus_backend", return_value="wtype") as probe:
             self.assertTrue(inj.inject_text("stay on ibus"))
         probe.assert_not_called()
         inj._ibus_injector.inject_text.assert_called_once_with("stay on ibus")
+
+    def test_toggle_is_reread_each_injection(self):
+        """The toggle is read fresh per injection so it applies without restart."""
+        inj = self._routing_injector(enabled=False)
+        with patch.object(inj, "_wayland_focus_backend", return_value="wtype"):
+            # First call: disabled -> IBus.
+            inj.inject_text("first")
+            inj._ibus_injector.inject_text.assert_called_once_with("first")
+            # Flip the stored config to enabled; next call must pick it up.
+            inj._load_routing_config.return_value = (True, [])
+            inj.inject_text("second")
+        inj._inject_with_wayland_tool.assert_called_once_with("second")

@@ -713,6 +713,10 @@ class TextInjector:
                 current_env = self.environment
                 ibus_injector = self._ibus_injector
 
+            # Re-read the "Sway compatibility" settings each time so the toggle
+            # applies without restarting Vocalinux (matches copy_to_clipboard).
+            self._sway_compatibility, self._force_ibus_apps = self._load_routing_config()
+
             # Decide whether IBus can deliver to the focused window. With "Sway
             # compatibility" enabled, IBus commits never reach native-Wayland
             # surfaces (e.g. Chromium), so route those injections to the Wayland
