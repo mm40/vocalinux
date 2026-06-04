@@ -1504,7 +1504,7 @@ class TestIBusRuntimeFallback(unittest.TestCase):
             self.assertEqual(injector.environment, DesktopEnvironment.WAYLAND_IBUS)
 
             # Isolate the IBus->wtype runtime fallback from per-window routing.
-            injector._window_aware_injection = False
+            injector._sway_compatibility = False
             result = injector.inject_text("Hello via wayland fallback")
 
         self.assertTrue(result)
@@ -1649,10 +1649,19 @@ class TestWaylandWindowAwareRouting(unittest.TestCase):
         """Build a bare TextInjector with only the attributes routing needs."""
         inj = TextInjector.__new__(TextInjector)
         inj._force_ibus_apps = []
-        inj._window_aware_injection = True
+        inj._sway_compatibility = True
         for k, v in attrs.items():
             setattr(inj, k, v)
         return inj
+
+    # ---- default is off (behaviour unchanged unless opted in) ----
+
+    @patch("vocalinux.text_injection.text_injector.os.path.exists", return_value=False)
+    def test_sway_compatibility_defaults_off(self, mock_exists):
+        """With no config file, Sway compatibility is disabled by default."""
+        enabled, force = TextInjector._load_routing_config(self._injector())
+        self.assertFalse(enabled)
+        self.assertEqual(force, [])
 
     # ---- _wayland_focus_backend detection ----
 
@@ -1737,7 +1746,7 @@ class TestWaylandWindowAwareRouting(unittest.TestCase):
     def test_disabled_routing_always_uses_ibus(self):
         """With window-aware routing off, IBus is used even for native Wayland."""
         inj = self._routing_injector()
-        inj._window_aware_injection = False
+        inj._sway_compatibility = False
         with patch.object(inj, "_wayland_focus_backend", return_value="wtype") as probe:
             self.assertTrue(inj.inject_text("stay on ibus"))
         probe.assert_not_called()

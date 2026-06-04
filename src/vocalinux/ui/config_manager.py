@@ -56,12 +56,14 @@ DEFAULT_CONFIG = {
     },
     "text_injection": {
         "copy_to_clipboard": False,  # Disabled by default; users can enable in Settings
-        # Wayland only: route each injection by focused-window type. IBus reaches
-        # X11/XWayland clients but not native-Wayland surfaces (e.g. Chromium),
-        # which fall back to the Wayland virtual-keyboard tool (wtype/ydotool).
-        "wayland_window_aware_injection": True,
+        # "Sway compatibility" (Wayland only). When enabled, route each injection
+        # by focused-window type: IBus reaches X11/XWayland clients but not
+        # native-Wayland surfaces (e.g. Chromium), which fall back to the Wayland
+        # virtual-keyboard tool (wtype/ydotool). When disabled, behaviour is
+        # unchanged (IBus is used for every window, exactly as before).
+        "sway_compatibility": False,
         # app_id/class substrings that should always use IBus even if detected
-        # as native-Wayland (e.g. a native-Wayland GTK app that is an IBus client).
+        # as native-Wayland (only consulted when sway_compatibility is enabled).
         "force_ibus_apps": [],
     },
     "advanced": {

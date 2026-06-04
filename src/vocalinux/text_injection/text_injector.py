@@ -82,11 +82,13 @@ class TextInjector:
         self._clipboard_tool_health = {}
         self._clipboard_timeout = 0.35
 
-        # Window-aware injection routing (Wayland only). IBus commits reach
-        # X11/XWayland clients but not native-Wayland surfaces (Chromium,
-        # Electron, ...), so for those windows we fall back to the Wayland
-        # virtual-keyboard tool while keeping IBus everywhere it works.
-        self._window_aware_injection, self._force_ibus_apps = self._load_routing_config()
+        # "Sway compatibility" (Wayland only, off by default). When enabled,
+        # IBus commits — which reach X11/XWayland clients but not native-Wayland
+        # surfaces (Chromium, Electron, ...) — are routed per window, falling
+        # back to the Wayland virtual-keyboard tool for native-Wayland windows
+        # while keeping IBus everywhere it works. When disabled, injection
+        # behaves exactly as before (IBus for every window).
+        self._sway_compatibility, self._force_ibus_apps = self._load_routing_config()
 
         # Force Wayland mode if requested
         if wayland_mode and self.environment == DesktopEnvironment.X11:
@@ -585,13 +587,14 @@ class TextInjector:
 
     def _load_routing_config(self) -> tuple:
         """
-        Read window-aware injection settings from the user config.
+        Read the "Sway compatibility" injection settings from the user config.
 
         Returns:
-            (enabled, force_ibus_apps). Defaults to enabled with no forced
-            apps. Reading is best-effort to avoid a hard UI dependency.
+            (enabled, force_ibus_apps). Defaults to disabled with no forced
+            apps, so behaviour is unchanged unless the user opts in. Reading is
+            best-effort to avoid a hard UI dependency.
         """
-        enabled = True
+        enabled = False
         force_ibus_apps: list = []
         try:
             import json
@@ -600,10 +603,10 @@ class TextInjector:
             if os.path.exists(config_path):
                 with open(config_path, "r") as f:
                     section = json.load(f).get("text_injection", {})
-                enabled = section.get("wayland_window_aware_injection", True)
+                enabled = section.get("sway_compatibility", False)
                 force_ibus_apps = section.get("force_ibus_apps", []) or []
         except Exception as e:
-            logger.debug(f"Could not read window-aware injection config: {e}")
+            logger.debug(f"Could not read Sway compatibility config: {e}")
         return enabled, force_ibus_apps
 
     def _wayland_focus_backend(self) -> str:
@@ -710,10 +713,10 @@ class TextInjector:
                 current_env = self.environment
                 ibus_injector = self._ibus_injector
 
-            # Decide whether IBus can deliver to the focused window. On Wayland,
-            # IBus commits never reach native-Wayland surfaces (e.g. Chromium),
-            # so route those injections to the Wayland virtual-keyboard tool while
-            # keeping IBus for X11/XWayland clients.
+            # Decide whether IBus can deliver to the focused window. With "Sway
+            # compatibility" enabled, IBus commits never reach native-Wayland
+            # surfaces (e.g. Chromium), so route those injections to the Wayland
+            # virtual-keyboard tool while keeping IBus for X11/XWayland clients.
             use_ibus = (
                 current_env == DesktopEnvironment.WAYLAND_IBUS
                 or current_env == DesktopEnvironment.X11_IBUS
@@ -721,7 +724,7 @@ class TextInjector:
             if (
                 use_ibus
                 and current_env == DesktopEnvironment.WAYLAND_IBUS
-                and self._window_aware_injection
+                and self._sway_compatibility
                 and getattr(self, "wayland_tool", None)
                 and self._wayland_focus_backend() == "wtype"
             ):
